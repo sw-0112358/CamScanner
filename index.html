@@ -273,6 +273,8 @@ input[type=range]::-moz-range-thumb{width:13px;height:13px;border-radius:50%;bac
   <div class="visor-toolbar" id="visorToolbar">
     <span class="vt-sel-count" id="vtSelCount">0 seleccionadas</span>
     <button class="vtbtn vtbtn-accent" onclick="autoCropSeleccion()">✂️ Auto-recortar</button>
+    <button class="vtbtn vtbtn-warn"   onclick="rotarSeleccion(90)">↻ Rotar 90°</button>
+    <button class="vtbtn"              onclick="rotarSeleccion(-90)">↺ -90°</button>
   </div>
 </div>
 
@@ -287,9 +289,10 @@ input[type=range]::-moz-range-thumb{width:13px;height:13px;border-radius:50%;bac
     <canvas id="cropCanvas"></canvas>
   </div>
   <div class="crop-acciones">
-    <button class="vtbtn vtbtn-accent" onclick="confirmarCropManual()">✅ Aplicar</button>
-    <button class="vtbtn vtbtn-warn" onclick="resetCropEsquinas()">↺ Reiniciar</button>
-    <button class="vtbtn" onclick="cerrarCropManual()">✕ Cerrar</button>
+    <button class="vtbtn vtbtn-accent" onclick="aplicarCropAlBuffer()">📌 Aplicar</button>
+    <button class="vtbtn vtbtn-warn"   onclick="resetCropEsquinas()">↺ Reiniciar</button>
+    <button class="vtbtn" style="background:rgba(39,174,96,0.8);border-color:rgba(39,174,96,0.5)" onclick="guardarBufferYCerrar()">💾 Guardar todo</button>
+    <button class="vtbtn"              onclick="descartarBufferYCerrar()">✕ Cerrar</button>
   </div>
 </div>
 
@@ -978,25 +981,70 @@ window.addEventListener('touchmove',e=>{
 window.addEventListener('mouseup',()=>_finDrag());
 window.addEventListener('touchend',()=>_finDrag());
 
-async function confirmarCropManual(){
-  if(!_visorTarjetaId)return;
-  const t=await dbObtener(_visorTarjetaId);if(!t?.zipFiltradoBlob){setStatus('❌ Necesita ZIP filtrado');return;}
+// Buffer de ediciones en memoria: Map<nombre, blob>
+let _editBuffer = new Map();
+
+async function aplicarCropAlBuffer(){
   const xs=_esquinas.map(e=>e.x),ys=_esquinas.map(e=>e.y);
   const x1=Math.round(Math.min(...xs)),y1=Math.round(Math.min(...ys));
   const rw=Math.round(Math.max(...xs))-x1,rh=Math.round(Math.max(...ys))-y1;
   if(rw<10||rh<10){setStatus('❌ Área muy pequeña');return;}
-  const rect={x:x1,y:y1,w:rw,h:rh};const nombreRecortado=_cropNombre;
-  setStatus(`📐 Recortando "${nombreRecortado}"…`);setProgress(0);
-  const zipIn=await JSZip.loadAsync(t.zipFiltradoBlob);const zipOut=new JSZip();
-  const nombres=Object.keys(zipIn.files).filter(n=>!zipIn.files[n].dir);let done=0;
+
+  // Obtener blob base: del buffer si ya fue editada, si no del ZIP original
+  const blobBase = _editBuffer.has(_cropNombre)
+    ? _editBuffer.get(_cropNombre)
+    : await _getBlobDelZip(_cropNombre);
+
+  const rect={x:x1,y:y1,w:rw,h:rh};
+  const recortado = await _doCropBlob(blobBase, rect);
+  _editBuffer.set(_cropNombre, recortado);
+
+  // Marcar visualmente en el label
+  setStatus(`📌 "${_cropNombre}" en buffer (${_editBuffer.size} pendiente${_editBuffer.size!==1?'s':''})`);
+
+  // Actualizar la imagen en el canvas para ver el resultado
+  await _cargarCropBlob(recortado);
+}
+
+async function _getBlobDelZip(nombre){
+  if(!_visorZip)return null;
+  return await _visorZip.files[nombre].async('blob');
+}
+
+async function guardarBufferYCerrar(){
+  if(!_editBuffer.size){descartarBufferYCerrar();return;}
+  const t=await dbObtener(_visorTarjetaId);
+  if(!t?.zipFiltradoBlob){setStatus('❌ Sin ZIP filtrado');return;}
+
+  setStatus(`💾 Guardando ${_editBuffer.size} edición${_editBuffer.size!==1?'es':''}…`);setProgress(0);
+  const zipIn=await JSZip.loadAsync(t.zipFiltradoBlob);
+  const zipOut=new JSZip();
+  const nombres=Object.keys(zipIn.files).filter(n=>!zipIn.files[n].dir);
+  let done=0;
   for(const nombre of nombres){
-    const blob=await zipIn.files[nombre].async('blob');
-    zipOut.file(nombre,nombre===nombreRecortado?await _doCropBlob(blob,rect):blob);
+    const blob = _editBuffer.has(nombre)
+      ? _editBuffer.get(nombre)
+      : await zipIn.files[nombre].async('blob');
+    zipOut.file(nombre, blob);
     setProgress(Math.round(++done/nombres.length*100));
   }
-  t.zipFiltradoBlob=await zipOut.generateAsync({type:'blob'});t.nombreArchivoFilt=`filt_${uuid()}.zip`;
-  await dbGuardar(t);setStatus(`✅ Recorte aplicado — "${nombreRecortado}"`);setProgress(100);
-  cerrarCropManual();renderGrid();await verTarjeta(_visorTarjetaId);
+  t.zipFiltradoBlob=await zipOut.generateAsync({type:'blob'});
+  t.nombreArchivoFilt=`filt_${uuid()}.zip`;
+  await dbGuardar(t);
+  setStatus(`✅ ${_editBuffer.size} edición${_editBuffer.size!==1?'es':''} guardada${_editBuffer.size!==1?'s':''}`);
+  setProgress(100);
+  _editBuffer.clear();
+  cerrarCropManual();
+  renderGrid();
+  await verTarjeta(_visorTarjetaId);
+}
+
+function descartarBufferYCerrar(){
+  if(_editBuffer.size>0){
+    if(!confirm(`Hay ${_editBuffer.size} edición${_editBuffer.size!==1?'es':''} sin guardar. ¿Descartar?`))return;
+  }
+  _editBuffer.clear();
+  cerrarCropManual();
 }
 
 function _doCropBlob(blob,rect){
@@ -1015,6 +1063,71 @@ function _doCropBlob(blob,rect){
 function cerrarCropManual(){
   document.getElementById('cropOverlay').classList.remove('show');
   _dragging=null;_cropImgEl=null;_cropNombre=null;
+  _editBuffer.clear();
+}
+
+// Al navegar entre imágenes en el crop, usar el buffer si existe
+const _navegarCropOrig=_navegarCrop;
+async function _navegarCrop(delta){
+  const sig=_cropIdx+delta;if(sig<0||sig>=_cropLista.length)return;
+  _cropIdx=sig;_cropNombre=_cropLista[_cropIdx];
+  document.getElementById('cropNombreLabel').textContent=
+    `${_cropIdx+1} / ${_cropLista.length}  —  ${_cropNombre.replace(/\.[^.]+$/,'')}${_editBuffer.has(_cropNombre)?' 📌':''}`;
+  // Usar blob del buffer si ya fue editado, si no del ZIP
+  const blob = _editBuffer.has(_cropNombre)
+    ? _editBuffer.get(_cropNombre)
+    : await _visorZip.files[_cropNombre].async('blob');
+  await _cargarCropBlob(blob);
+}
+
+/* ── Rotar imágenes seleccionadas ── */
+async function rotarSeleccion(grados){
+  if(!_seleccionadas.size){setStatus('❌ Selecciona imágenes primero');return;}
+  const t=await dbObtener(_visorTarjetaId);
+  if(!t?.zipFiltradoBlob){setStatus('❌ Necesita ZIP filtrado');return;}
+  const cantSelec=_seleccionadas.size;
+  const idTarjeta=_visorTarjetaId;
+  const selCopia=new Set(_seleccionadas);
+
+  cerrarVisor();
+  setStatus(`↻ Rotando ${cantSelec} imágenes…`);setProgress(0);
+
+  const zipIn=await JSZip.loadAsync(t.zipFiltradoBlob);
+  const zipOut=new JSZip();
+  const nombres=Object.keys(zipIn.files).filter(n=>!zipIn.files[n].dir);
+  let done=0;
+  for(const nombre of nombres){
+    const blob=await zipIn.files[nombre].async('blob');
+    zipOut.file(nombre, selCopia.has(nombre) ? await _rotarBlob(blob,grados) : blob);
+    setProgress(Math.round(++done/nombres.length*100));
+    setStatus(`↻ ${done}/${nombres.length} — ${nombre}`);
+  }
+  t.zipFiltradoBlob=await zipOut.generateAsync({type:'blob'});
+  t.nombreArchivoFilt=`filt_${uuid()}.zip`;
+  await dbGuardar(t);
+  setStatus(`✅ ${cantSelec} imágenes rotadas ${grados>0?'+':''}${grados}°`);
+  setProgress(100);
+  renderGrid();
+  await verTarjeta(idTarjeta);
+}
+
+function _rotarBlob(blob,grados){
+  return new Promise(res=>{
+    const url=URL.createObjectURL(blob);const img=new Image();
+    img.onload=()=>{
+      const rad=grados*Math.PI/180;
+      const sin=Math.abs(Math.sin(rad)),cos=Math.abs(Math.cos(rad));
+      const W=Math.round(img.naturalWidth*cos+img.naturalHeight*sin);
+      const H=Math.round(img.naturalWidth*sin+img.naturalHeight*cos);
+      const c=document.createElement('canvas');c.width=W;c.height=H;
+      const ctx=c.getContext('2d');
+      ctx.translate(W/2,H/2);ctx.rotate(rad);
+      ctx.drawImage(img,-img.naturalWidth/2,-img.naturalHeight/2);
+      URL.revokeObjectURL(url);
+      const mime=fmtActivo==='png'?'image/png':fmtActivo==='webp'?'image/webp':'image/jpeg';
+      c.toBlob(b=>res(b),mime,filtros.calidad/100);
+    };img.src=url;
+  });
 }
 
 /* ═══ 11. RENDER GRID ═══ */
